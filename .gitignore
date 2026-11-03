@@ -1,0 +1,14 @@
+# Bien dich
+out/
+*.class
+
+# Tap du lieu lon (khong can commit len git)
+*.csv
+!results.csv
+*.txt
+!*.centers.txt
+
+# IDE / System
+.idea/
+.vscode/
+*.iml
