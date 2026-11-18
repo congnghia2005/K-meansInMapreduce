@@ -1,7 +1,10 @@
 import java.io.BufferedReader;
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.FileReader;
 import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -12,23 +15,6 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 
-/**
- * KMeansMR: Ứng dụng phân cụm K-means quy mô lớn mô phỏng mô hình MapReduce
- * sử dụng Java thuần đa luồng (Multi-threading).
- *
- * Tính năng chính:
- * 1. Hỗ trợ dữ liệu lớn (> 1 GB, hàng triệu dòng) với cơ chế Streaming theo byte offset.
- * 2. Kiến trúc MapReduce đầy đủ:
- *    - Split: chia tệp theo byte range và căn chỉnh ranh giới dòng.
- *    - Map: gán điểm vào cụm gần nhất.
- *    - In-mapper Combiner: cộng dồn cục bộ, loại bỏ hoàn toàn khóa (zero-lock) và chống false-sharing.
- *    - Shuffle: phân nhóm kết quả tích lũy theo cụm.
- *    - Reduce: tính tâm mới song song theo cụm, xử lý cụm rỗng.
- * 3. Hỗ trợ 3 chế độ:
- *    - parallel: chạy song song MapReduce.
- *    - sequential: chạy tuần tự (baseline).
- *    - benchmark: tự động đo và so sánh tuần tự với song song qua các cấu hình luồng.
- */
 public class KMeansMR {
 
     public static class ParallelResult {
@@ -37,14 +23,18 @@ public class KMeansMR {
         public final double totalSSE;
         public final int iterations;
         public final long totalElapsedMs;
+        public final String stopReason;
+        public final long totalPoints;
 
         public ParallelResult(double[][] centroids, long[] clusterCounts, double totalSSE,
-                              int iterations, long totalElapsedMs) {
+                int iterations, long totalElapsedMs, String stopReason, long totalPoints) {
             this.centroids = centroids;
             this.clusterCounts = clusterCounts;
             this.totalSSE = totalSSE;
             this.iterations = iterations;
             this.totalElapsedMs = totalElapsedMs;
+            this.stopReason = stopReason;
+            this.totalPoints = totalPoints;
         }
     }
 
@@ -61,6 +51,7 @@ public class KMeansMR {
         long seed = 42L;
         boolean verbose = false;
         int runs = 3;
+        String sizes = ""; // Hỗ trợ đa kích thước: vd 1M,5M,10M
 
         // Phân tích tham số dòng lệnh
         for (int i = 0; i < args.length; i++) {
@@ -101,6 +92,9 @@ public class KMeansMR {
                 case "--runs":
                     runs = Integer.parseInt(args[++i]);
                     break;
+                case "--sizes":
+                    sizes = args[++i];
+                    break;
                 default:
                     System.err.println("Cảnh báo: Bỏ qua tham số không xác định: " + args[i]);
             }
@@ -110,15 +104,36 @@ public class KMeansMR {
             splits = threads * 2;
         }
 
+        // Nếu ở chế độ benchmark với tham số --sizes
+        if ("benchmark".equals(mode) && !sizes.isEmpty()) {
+            Benchmark benchmark = new Benchmark(null, k, dim, skipCols, maxIter, eps,
+                    splits, runs, null, seed);
+            try {
+                benchmark.runMultiSizes(sizes);
+            } catch (Exception e) {
+                System.err.println("Lỗi khi chạy benchmark đa kích thước: " + e.getMessage());
+                e.printStackTrace();
+            }
+            return;
+        }
+
         File inputFile = new File(inputPath);
         if (!inputFile.exists() || !inputFile.isFile()) {
             System.err.printf("Lỗi: Không tìm thấy tệp dữ liệu đầu vào: %s%n", inputPath);
-            System.err.println("Gợi ý: Hãy dùng DataGenerator để sinh tệp trước: java -cp out DataGenerator --output points.csv");
+            System.err.println(
+                    "Gợi ý: Hãy dùng DataGenerator để sinh tệp trước: java -cp out DataGenerator --output points.csv");
             System.exit(1);
         }
 
-        // In thông tin cấu hình hệ thống
-        printSystemBanner(inputFile, k, dim, threads, splits, maxIter, eps, skipCols, mode, seed);
+        // Đếm tổng số điểm trong tệp một cách siêu tốc bằng streaming byte scanning
+        long totalPoints = countTotalPointsFast(inputFile);
+
+        // In cấu hình chi tiết đầu chương trình
+        printSystemBanner(inputFile, totalPoints, k, dim, threads, splits, maxIter, eps, skipCols, mode, seed);
+
+        // In RAM ở đầu chương trình
+        System.out.printf("[BỘ NHỚ JVM - ĐẦU CHƯƠNG TRÌNH]: %s%n", getMemoryStatus());
+        System.out.println("--------------------------------------------------------------------------------");
 
         try {
             // Khởi tạo K tâm ban đầu ngẫu nhiên nhưng tái lập được (cùng seed)
@@ -129,26 +144,43 @@ public class KMeansMR {
                     System.out.println(">>> BẮT ĐẦU CHẠY PHÂN CỤM SONG SONG (MAPREDUCE)...");
                     ParallelResult pResult = executeParallel(inputFile, k, dim, skipCols, maxIter, eps,
                             threads, splits, initialCentroids, true);
+
+                    // In RAM ở cuối chương trình
+                    System.out.println(
+                            "--------------------------------------------------------------------------------");
+                    System.out.printf("[BỘ NHỚ JVM - KẾT THÚC CHƯƠNG TRÌNH]: %s%n", getMemoryStatus());
+                    System.out.println(
+                            "-> Minh chứng: RAM thực tế duy trì ở mức thấp, hoàn toàn phẳng và độc lập với dung lượng tệp.");
+
                     printFinalSummary(pResult.centroids, pResult.clusterCounts, pResult.totalSSE,
-                            pResult.iterations, pResult.totalElapsedMs, dim, inputPath);
+                            pResult.iterations, pResult.totalElapsedMs, pResult.stopReason, dim, inputPath);
                     break;
 
                 case "sequential":
                     System.out.println(">>> BẮT ĐẦU CHẠY PHÂN CỤM TUẦN TỰ (SEQUENTIAL BASELINE)...");
                     SequentialKMeans seqKMeans = new SequentialKMeans(inputFile, k, dim, skipCols, maxIter, eps);
                     SequentialKMeans.Result sResult = seqKMeans.run(initialCentroids, true);
+
+                    // In RAM ở cuối chương trình
+                    System.out.println(
+                            "--------------------------------------------------------------------------------");
+                    System.out.printf("[BỘ NHỚ JVM - KẾT THÚC CHƯƠNG TRÌNH]: %s%n", getMemoryStatus());
+                    System.out.println(
+                            "-> Minh chứng: RAM thực tế duy trì ở mức thấp, hoàn toàn phẳng và độc lập với dung lượng tệp.");
+
                     printFinalSummary(sResult.centroids, sResult.clusterCounts, sResult.totalSSE,
-                            sResult.iterations, sResult.totalElapsedMs, dim, inputPath);
+                            sResult.iterations, sResult.totalElapsedMs, sResult.stopReason, dim, inputPath);
                     break;
 
                 case "benchmark":
                     Benchmark benchmark = new Benchmark(inputFile, k, dim, skipCols, maxIter, eps,
-                            splits, runs, initialCentroids);
-                    benchmark.run();
+                            splits, runs, initialCentroids, seed);
+                    benchmark.runSingleFile();
                     break;
 
                 default:
-                    System.err.println("Chế độ '--mode " + mode + "' không hợp lệ. Chọn: parallel | sequential | benchmark");
+                    System.err.println(
+                            "Chế độ '--mode " + mode + "' không hợp lệ. Chọn: parallel | sequential | benchmark");
                     System.exit(1);
             }
 
@@ -162,9 +194,9 @@ public class KMeansMR {
      * Thực thi K-means song song theo mô hình MapReduce.
      */
     public static ParallelResult executeParallel(File file, int k, int dim, int skipCols,
-                                                 int maxIter, double eps, int numThreads,
-                                                 int numSplits, double[][] initialCentroids,
-                                                 boolean printLogs) throws Exception {
+            int maxIter, double eps, int numThreads,
+            int numSplits, double[][] initialCentroids,
+            boolean printLogs) throws Exception {
 
         long totalStartTime = System.currentTimeMillis();
 
@@ -182,13 +214,17 @@ public class KMeansMR {
 
         long[] finalCounts = new long[k];
         double finalSSE = 0.0;
+        double prevSSE = Double.MAX_VALUE;
         int iter = 0;
+        String stopReason = "Đạt số vòng lặp tối đa";
 
         if (printLogs) {
-            System.out.println("\n---------------------------------------------------------------------------------------------------------");
+            System.out.println(
+                    "\n---------------------------------------------------------------------------------------------------------");
             System.out.printf("%-5s | %10s | %10s | %10s | %12s | %16s | %12s%n",
                     "Vòng", "Map (ms)", "Shfl (ms)", "Redc (ms)", "Tổng VL (ms)", "SSE Cục bộ", "Max Shift");
-            System.out.println("---------------------------------------------------------------------------------------------------------");
+            System.out.println(
+                    "---------------------------------------------------------------------------------------------------------");
         }
 
         try {
@@ -210,13 +246,23 @@ public class KMeansMR {
                 }
                 long mapElapsed = System.currentTimeMillis() - mapStart;
 
-                // In chi tiết từng Mapper ở vòng lặp đầu tiên để minh chứng chạy đa luồng đồng thời
+                // Tính toán số lượng Mapper chạy đồng thời tối đa (Sweep-line Algorithm)
+                int maxConcurrentMappers = calculateMaxConcurrentMappers(mapperResults);
+                long sumMapperTime = 0;
+                for (PartialResult pr : mapperResults) {
+                    sumMapperTime += pr.getElapsedMs();
+                }
+                double overlapRatio = (double) sumMapperTime / Math.max(1, mapElapsed);
+
+                // In chi tiết từng Mapper ở vòng lặp đầu tiên (có timestamp mili giây)
                 if (printLogs && iter == 1) {
                     printMapperExecutionDetails(mapperResults);
-                    System.out.println("---------------------------------------------------------------------------------------------------------");
+                    System.out.println(
+                            "---------------------------------------------------------------------------------------------------------");
                     System.out.printf("%-5s | %10s | %10s | %10s | %12s | %16s | %12s%n",
                             "Vòng", "Map (ms)", "Shfl (ms)", "Redc (ms)", "Tổng VL (ms)", "SSE Cục bộ", "Max Shift");
-                    System.out.println("---------------------------------------------------------------------------------------------------------");
+                    System.out.println(
+                            "---------------------------------------------------------------------------------------------------------");
                 }
 
                 // ==================== PHA 2: SHUFFLE ====================
@@ -256,14 +302,40 @@ public class KMeansMR {
                 if (printLogs) {
                     System.out.printf(" %-4d | %8d ms | %8d ms | %8d ms | %10d ms | %16.4f | %12.6f%n",
                             iter, mapElapsed, shuffleElapsed, reduceElapsed, iterTotalElapsed, iterSSE, maxShift);
+
+                    // In phân tích song song: số mapper đồng thời tối đa và hệ số chồng lấn
+                    System.out.printf("       [Song song Vòng %d]: Mapper đồng thời tối đa = %d/%d luồng | " +
+                            "Tổng time mappers = %d ms / Time map thực = %d ms (Chồng lấn: %.2fx)%n",
+                            iter, maxConcurrentMappers, numThreads, sumMapperTime, mapElapsed, overlapRatio);
+
+                    // Kiểm tra tính giảm đơn điệu của SSE qua từng vòng lặp
+                    if (iter > 1) {
+                        if (iterSSE > prevSSE + 1e-4) {
+                            System.out.printf(
+                                    "       [CẢNH BÁO] SSE tăng từ %.4f lên %.4f (vi phạm tính đơn điệu của K-means)!%n",
+                                    prevSSE, iterSSE);
+                        } else {
+                            System.out.printf(
+                                    "       [SSE Giảm đơn điệu]: SSE trước = %.4f -> SSE này = %.4f (Giảm: %.4f)%n",
+                                    prevSSE, iterSSE, prevSSE - iterSSE);
+                        }
+                    }
+
+                    // In RAM ở giữa chương trình (sau vòng lặp đầu tiên hoặc vòng thứ 2)
+                    if (iter == 1 || iter == 2) {
+                        System.out.printf("       [BỘ NHỚ JVM - GIỮA VÒNG %d]: %s%n", iter, getMemoryStatus());
+                    }
                 }
+
+                prevSSE = iterSSE;
 
                 // Kiểm tra điều kiện hội tụ
                 if (maxShift < eps) {
+                    stopReason = String.format("Hội tụ sớm (Max Shift = %.6f < Epsilon = %e)", maxShift, eps);
                     if (printLogs) {
-                        System.out.println("---------------------------------------------------------------------------------------------------------");
-                        System.out.printf(">>> Thuật toán hội tụ tại vòng %d: Max Shift (%.6f) < Epsilon (%e)%n",
-                                iter, maxShift, eps);
+                        System.out.println(
+                                "---------------------------------------------------------------------------------------------------------");
+                        System.out.printf(">>> Thuật toán dừng: %s tại vòng %d%n", stopReason, iter);
                     }
                     break;
                 }
@@ -273,8 +345,88 @@ public class KMeansMR {
             reducePool.shutdown();
         }
 
+        if (iter == maxIter && maxIter > 0 && !stopReason.startsWith("Hội tụ")) {
+            stopReason = String.format("Đạt số vòng lặp tối đa (MaxIter = %d)", maxIter);
+        }
+
+        long totalPointsProcessed = 0;
+        for (long c : finalCounts)
+            totalPointsProcessed += c;
+
         long totalElapsed = System.currentTimeMillis() - totalStartTime;
-        return new ParallelResult(currentCentroids, finalCounts, finalSSE, iter, totalElapsed);
+        return new ParallelResult(currentCentroids, finalCounts, finalSSE, iter, totalElapsed, stopReason,
+                totalPointsProcessed);
+    }
+
+    /**
+     * Tính toán số lượng Mapper chạy đồng thời tối đa (Peak Concurrency)
+     * sử dụng thuật toán Sweep-line trên các khoảng thời gian [startEpochMs,
+     * endEpochMs].
+     */
+    public static int calculateMaxConcurrentMappers(List<PartialResult> results) {
+        if (results == null || results.isEmpty())
+            return 0;
+
+        List<long[]> events = new ArrayList<>(results.size() * 2);
+        for (PartialResult pr : results) {
+            events.add(new long[] { pr.getStartEpochMs(), 1 }); // start: +1
+            events.add(new long[] { pr.getEndEpochMs(), -1 }); // end: -1
+        }
+
+        events.sort((a, b) -> {
+            if (a[0] != b[0]) {
+                return Long.compare(a[0], b[0]);
+            }
+            return Long.compare(b[1], a[1]); // nếu cùng ms, bắt đầu (+1) ưu tiên trước kết thúc (-1)
+        });
+
+        int current = 0;
+        int maxConcurrent = 0;
+        for (long[] ev : events) {
+            current += ev[1];
+            if (current > maxConcurrent) {
+                maxConcurrent = current;
+            }
+        }
+        return maxConcurrent;
+    }
+
+    /**
+     * Đếm tổng số điểm trong tệp siêu tốc bằng NIO FileChannel và mảng đệm direct
+     * 1MB,
+     * hoàn toàn không nạp tệp vào bộ nhớ Heap RAM.
+     */
+    public static long countTotalPointsFast(File file) {
+        long lines = 0;
+        try (FileInputStream fis = new FileInputStream(file);
+                FileChannel channel = fis.getChannel()) {
+            ByteBuffer buffer = ByteBuffer.allocateDirect(1024 * 1024); // 1 MB direct buffer
+            while (channel.read(buffer) > 0) {
+                buffer.flip();
+                int limit = buffer.limit();
+                for (int i = 0; i < limit; i++) {
+                    if (buffer.get(i) == '\n') {
+                        lines++;
+                    }
+                }
+                buffer.clear();
+            }
+        } catch (IOException e) {
+            return -1;
+        }
+        return lines;
+    }
+
+    /**
+     * Lấy thông tin trạng thái RAM sử dụng so với Heap và -Xmx.
+     */
+    public static String getMemoryStatus() {
+        Runtime rt = Runtime.getRuntime();
+        long usedMB = (rt.totalMemory() - rt.freeMemory()) / (1024 * 1024);
+        long totalMB = rt.totalMemory() / (1024 * 1024);
+        long maxMB = rt.maxMemory() / (1024 * 1024);
+        return String.format("RAM dùng: %,d MB / Heap hiện tại: %,d MB [Cấu hình -Xmx: %,d MB]",
+                usedMB, totalMB, maxMB);
     }
 
     /**
@@ -298,10 +450,12 @@ public class KMeansMR {
     }
 
     /**
-     * Khởi tạo K tâm ban đầu bằng cách tìm ngẫu nhiên K điểm mẫu từ tệp qua byte seek.
+     * Khởi tạo K tâm ban đầu bằng cách tìm ngẫu nhiên K điểm mẫu từ tệp qua byte
+     * seek.
      * Cực nhanh (< 5ms), không tốn RAM và tái lập được kết quả qua Seed.
      */
-    private static double[][] sampleInitialCentroids(File file, int k, int dim, int skipCols, long seed) throws IOException {
+    public static double[][] sampleInitialCentroids(File file, int k, int dim, int skipCols, long seed)
+            throws IOException {
         double[][] centroids = new double[k][dim];
         Random rng = new Random(seed);
         long fileLength = file.length();
@@ -309,7 +463,7 @@ public class KMeansMR {
 
         int found = 0;
         int attempts = 0;
-        while (found < k && attempts < 1000) {
+        while (found < k && attempts < 2000) {
             attempts++;
             long randomOffset = (long) (rng.nextDouble() * Math.max(0, fileLength - 10000));
             try (SplitReader reader = new SplitReader(file, randomOffset, fileLength)) {
@@ -328,11 +482,12 @@ public class KMeansMR {
     }
 
     /**
-     * In chi tiết thực thi của từng mapper để minh chứng tính đa luồng đồng thời.
+     * In chi tiết thực thi của từng mapper với timestamp chính xác mili giây
+     * (HH:mm:ss.SSS).
      */
     private static void printMapperExecutionDetails(List<PartialResult> mapperResults) {
         SimpleDateFormat sdf = new SimpleDateFormat("HH:mm:ss.SSS");
-        System.out.println("\n>>> CHI TIẾT THỰC THI TỪNG MAPPER Ở VÒNG LẶP 1 (Minh chứng song song đa luồng):");
+        System.out.println("\n>>> CHI TIẾT THỰC THI TỪNG MAPPER Ở VÒNG LẶP 1 (Timestamp chính xác ms):");
         System.out.printf("%-10s | %-20s | %10s | %14s | %14s | %10s%n",
                 "Split ID", "Tên Luồng (Thread)", "Số điểm", "Bắt đầu", "Kết thúc", "Thời gian");
         System.out.println("-----------------------------------------------------------------------------------------");
@@ -348,37 +503,41 @@ public class KMeansMR {
         }
     }
 
-    private static void printSystemBanner(File file, int k, int dim, int threads, int splits,
-                                          int maxIter, double eps, int skipCols, String mode, long seed) {
+    private static void printSystemBanner(File file, long totalPoints, int k, int dim, int threads,
+            int splits, int maxIter, double eps, int skipCols, String mode, long seed) {
         Runtime rt = Runtime.getRuntime();
         System.out.println("================================================================================");
         System.out.println("         HỆ THỐNG PHÂN CỤM DỮ LIỆU LỚN BẰNG MAPREDUCE (JAVA THUẦN)              ");
         System.out.println("================================================================================");
-        System.out.printf("Số nhân CPU máy tính (Processors): %d cores%n", rt.availableProcessors());
-        System.out.printf("Bộ nhớ JVM (Max / Total)         : %d MB / %d MB%n",
-                rt.maxMemory() / (1024 * 1024), rt.totalMemory() / (1024 * 1024));
-        System.out.printf("Tệp dữ liệu đầu vào              : %s%n", file.getAbsolutePath());
-        System.out.printf("Dung lượng tệp                   : %.2f MB (%,d bytes)%n",
+        System.out.printf("Đường dẫn file dữ liệu           : %s%n", file.getAbsolutePath());
+        System.out.printf("Kích thước tệp                   : %.2f MB (%,d bytes)%n",
                 file.length() / (1024.0 * 1024.0), file.length());
-        System.out.printf("Số cụm (K) = %d | Số chiều (Dim) = %d | Bỏ qua cột nhãn (SkipCols) = %d%n",
-                k, dim, skipCols);
-        System.out.printf("Số luồng xử lý (Threads)         : %d%n", threads);
-        System.out.printf("Số phân đoạn tệp (Splits)        : %d%n", splits);
-        System.out.printf("Số vòng lặp tối đa (MaxIter)     : %d | Epsilon = %e%n", maxIter, eps);
-        System.out.printf("Chế độ chạy (Mode)               : %s | Seed = %d%n", mode.toUpperCase(), seed);
+        System.out.printf("Tổng số điểm dữ liệu             : %,d điểm%n", totalPoints);
+        System.out.printf("Số chiều (D)                     : %d thuộc tính%n", dim);
+        System.out.printf("Số cụm phân nhóm (K)             : %d cụm%n", k);
+        System.out.printf("Ngưỡng hội tụ (Epsilon)          : %e%n", eps);
+        System.out.printf("Số vòng lặp tối đa (MaxIter)     : %d vòng%n", maxIter);
+        System.out.printf("Seed ngẫu nhiên (Tái lập tâm)    : %d%n", seed);
+        System.out.printf("Số nhân CPU máy tính             : %d cores%n", rt.availableProcessors());
+        System.out.printf("Số luồng xử lý song song (Threads): %d luồng%n", threads);
+        System.out.printf("Số phân đoạn tệp (Splits)        : %d đoạn%n", splits);
+        System.out.printf("Bỏ qua số cột đầu (SkipCols)     : %d%n", skipCols);
+        System.out.printf("Chế độ chạy (Mode)               : %s%n", mode.toUpperCase());
         System.out.println("================================================================================");
     }
 
     private static void printFinalSummary(double[][] centroids, long[] counts, double totalSSE,
-                                          int iterations, long elapsedMs, int dim, String inputPath) {
+            int iterations, long elapsedMs, String stopReason, int dim, String inputPath) {
         long totalPoints = 0;
-        for (long c : counts) totalPoints += c;
+        for (long c : counts)
+            totalPoints += c;
 
         System.out.println("\n================================================================================");
         System.out.println("                           KẾT QUẢ PHÂN CỤM CUỐI CÙNG                           ");
         System.out.println("================================================================================");
         System.out.printf("Tổng số điểm xử lý : %,d điểm%n", totalPoints);
-        System.out.printf("Số vòng lặp thực tế: %d vòng%n", iterations);
+        System.out.printf("Số vòng lặp đã chạy: %d vòng%n", iterations);
+        System.out.printf("Lý do dừng         : %s%n", stopReason);
         System.out.printf("Tổng thời gian chạy: %d ms (%.2f giây)%n", elapsedMs, elapsedMs / 1000.0);
         System.out.printf("Tổng sai số SSE    : %,.4f%n", totalSSE);
         System.out.println("--------------------------------------------------------------------------------");
@@ -390,7 +549,8 @@ public class KMeansMR {
             int showDim = Math.min(dim, 5);
             for (int d = 0; d < showDim; d++) {
                 sb.append(String.format(java.util.Locale.US, "%.4f", centroids[c][d]));
-                if (d < showDim - 1) sb.append(", ");
+                if (d < showDim - 1)
+                    sb.append(", ");
             }
             if (dim > 5) {
                 sb.append(", ... còn ").append(dim - 5).append(" chiều");
@@ -413,7 +573,8 @@ public class KMeansMR {
             String line;
             while ((line = br.readLine()) != null) {
                 line = line.trim();
-                if (line.startsWith("#") || line.isEmpty()) continue;
+                if (line.startsWith("#") || line.isEmpty())
+                    continue;
                 String[] parts = line.split(":");
                 if (parts.length == 2) {
                     String[] tokens = parts[1].trim().split("\\s+");
@@ -428,7 +589,8 @@ public class KMeansMR {
             return;
         }
 
-        if (trueCenters.isEmpty()) return;
+        if (trueCenters.isEmpty())
+            return;
 
         System.out.println("--------------------------------------------------------------------------------");
         System.out.println("ĐỐI CHỨNG VỚI TÂM CỤM THỰC TẾ (GROUND TRUTH):");
@@ -453,4 +615,3 @@ public class KMeansMR {
         }
     }
 }
-

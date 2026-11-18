@@ -1,8 +1,4 @@
-/**
- * Lớp Split đại diện cho một phân đoạn (chunk) của tệp dữ liệu được định nghĩa
- * theo byte offset [startByte, endByte).
- * Phù hợp với mô hình InputSplit trong MapReduce truyền thống.
- */
+
 public class Split {
     private final int splitIndex;
     private final long startByte;
@@ -36,4 +32,3 @@ public class Split {
                 splitIndex, startByte, endByte, getLength() / (1024.0 * 1024.0));
     }
 }
-

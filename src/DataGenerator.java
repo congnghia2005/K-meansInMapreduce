@@ -4,16 +4,6 @@ import java.io.FileWriter;
 import java.io.IOException;
 import java.util.Random;
 
-/**
- * DataGenerator: Chương trình sinh tập dữ liệu lớn tổng hợp (Synthetic Dataset)
- * theo mô hình phân phối hỗn hợp Gaussian (Gaussian Mixture Model).
- *
- * Tính năng:
- * - Tham số: N điểm, D chiều, K cụm thật, độ lệch chuẩn (stddev), seed ngẫu nhiên.
- * - Ghi trực tiếp ra file CSV qua BufferedWriter dạng streaming, KHÔNG nạp vào RAM.
- * - Cho phép sinh từ hàng triệu đến chục triệu điểm (file hàng GB) mà bộ nhớ RAM chỉ tốn vài MB.
- * - Tự động xuất file <output>.centers.txt chứa tâm cụm thực tế (Ground Truth) để đối chứng.
- */
 public class DataGenerator {
 
     public static void main(String[] args) {
@@ -152,4 +142,3 @@ public class DataGenerator {
         }
     }
 }
-

@@ -3,17 +3,8 @@ import java.io.File;
 import java.io.FileReader;
 import java.io.IOException;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.List;
 
-/**
- * SequentialKMeans: Phiên bản phân cụm K-means tuần tự (Baseline).
- * Chạy trên 1 luồng duy nhất, đọc tuần tự từng dòng trong file,
- * cập nhật tâm sau mỗi vòng lặp.
- *
- * Dùng làm đối chứng chuẩn (ground truth về hiệu năng T_tuần_tự)
- * để tính toán Speedup và Efficiency cho phiên bản song song.
- */
 public class SequentialKMeans {
     private final File file;
     private final int k;
@@ -29,15 +20,17 @@ public class SequentialKMeans {
         public final int iterations;
         public final long totalElapsedMs;
         public final List<Long> iterationTimesMs;
+        public final String stopReason;
 
         public Result(double[][] centroids, long[] clusterCounts, double totalSSE,
-                      int iterations, long totalElapsedMs, List<Long> iterationTimesMs) {
+                int iterations, long totalElapsedMs, List<Long> iterationTimesMs, String stopReason) {
             this.centroids = centroids;
             this.clusterCounts = clusterCounts;
             this.totalSSE = totalSSE;
             this.iterations = iterations;
             this.totalElapsedMs = totalElapsedMs;
             this.iterationTimesMs = iterationTimesMs;
+            this.stopReason = stopReason;
         }
     }
 
@@ -62,7 +55,9 @@ public class SequentialKMeans {
 
         long[] finalCounts = new long[k];
         double finalSSE = 0.0;
+        double prevSSE = Double.MAX_VALUE;
         int iter = 0;
+        String stopReason = "Đạt số vòng tối đa";
 
         while (iter < maxIter) {
             iter++;
@@ -138,26 +133,41 @@ public class SequentialKMeans {
             iterationTimes.add(iterElapsed);
 
             if (verbose) {
-                System.out.printf("[Tuần tự] Vòng %2d | Thời gian: %6d ms | SSE: %14.4f | Shift: %.6f%n",
+                System.out.printf("[Tuần tự] Vòng %2d | Thời gian: %6d ms | SSE: %16.4f | Shift: %.6f%n",
                         iter, iterElapsed, sse, maxShift);
+
+                // Kiểm tra tính giảm đơn điệu của SSE
+                if (iter > 1) {
+                    if (sse > prevSSE + 1e-4) {
+                        System.out.printf("  [CẢNH BÁO] SSE tăng từ %.4f lên %.4f (vi phạm tính đơn điệu)!%n",
+                                prevSSE, sse);
+                    } else {
+                        System.out.printf("  [SSE Giảm đơn điệu]: SSE trước = %.4f -> SSE này = %.4f (Giảm: %.4f)%n",
+                                prevSSE, sse, prevSSE - sse);
+                    }
+                }
             }
 
             currentCentroids = newCentroids;
             finalCounts = clusterCounts;
             finalSSE = sse;
+            prevSSE = sse;
 
             // Kiểm tra điều kiện hội tụ
             if (maxShift < eps) {
+                stopReason = String.format("Hội tụ sớm (Max Shift = %.6f < Epsilon = %e)", maxShift, eps);
                 if (verbose) {
-                    System.out.printf("[Tuần tự] Thuật toán hội tụ tại vòng %d (shift = %.6f < eps = %e)%n",
-                            iter, maxShift, eps);
+                    System.out.printf("[Tuần tự] Thuật toán hội tụ tại vòng %d: %s%n", iter, stopReason);
                 }
                 break;
             }
         }
 
+        if (iter == maxIter && maxIter > 0) {
+            stopReason = String.format("Đạt số vòng lặp tối đa (MaxIter = %d)", maxIter);
+        }
+
         long totalElapsed = System.currentTimeMillis() - startTime;
-        return new Result(currentCentroids, finalCounts, finalSSE, iter, totalElapsed, iterationTimes);
+        return new Result(currentCentroids, finalCounts, finalSSE, iter, totalElapsed, iterationTimes, stopReason);
     }
 }
-

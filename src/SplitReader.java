@@ -3,16 +3,6 @@ import java.io.File;
 import java.io.IOException;
 import java.io.RandomAccessFile;
 
-/**
- * SplitReader: Bộ đọc luồng (streaming) cho từng phân đoạn tệp theo byte offset.
- * Đảm bảo:
- * 1. Không nạp toàn bộ tệp vào RAM, dùng bộ đệm 64KB.
- * 2. Căn chỉnh chính xác ranh giới dòng (line boundary):
- *    - Nếu startByte > 0, bỏ qua phần còn lại của dòng đang dở dang (do split trước đã đọc).
- *    - Nếu dòng bắt đầu trước endByte, đọc hết toàn bộ dòng đó dù nó tràn qua endByte.
- *    - Dừng đọc khi bắt đầu một dòng mới có vị trí byte >= endByte.
- * 3. Hỗ trợ cả định dạng kết thúc dòng chuẩn Unix (\n) và Windows (\r\n).
- */
 public class SplitReader implements Closeable {
     private final RandomAccessFile raf;
     private final long endByte;
@@ -128,4 +118,3 @@ public class SplitReader implements Closeable {
         raf.close();
     }
 }
-

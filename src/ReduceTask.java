@@ -1,16 +1,6 @@
 import java.util.List;
 import java.util.concurrent.Callable;
 
-/**
- * ReduceTask: Tác vụ rút gọn (Reducer) chạy song song cho từng cụm (hoặc nhóm cụm).
- *
- * Nhiệm vụ:
- * 1. Nhận danh sách PartialResult từ tất cả các Mapper sau pha Shuffle.
- * 2. Gom tổng vector và tổng số lượng điểm của cụm được phân công.
- * 3. Tính toán trọng tâm mới: c'_k = sumVector / totalPoints.
- * 4. Xử lý cụm rỗng (Empty Cluster): nếu không có điểm nào rơi vào cụm, giữ nguyên tâm cũ.
- * 5. Tính độ dịch chuyển không gian (Euclidean shift) giữa tâm mới và tâm cũ.
- */
 public class ReduceTask implements Callable<ReduceTask.ClusterUpdate> {
     private final int clusterId;
     private final List<PartialResult> mapperResults;
@@ -95,4 +85,3 @@ public class ReduceTask implements Callable<ReduceTask.ClusterUpdate> {
         return new ClusterUpdate(clusterId, newCentroid, totalPoints, clusterSSE, shift);
     }
 }
-

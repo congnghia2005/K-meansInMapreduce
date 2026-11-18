@@ -1,18 +1,6 @@
 import java.io.File;
 import java.util.concurrent.Callable;
 
-/**
- * MapTask: Thực thi tác vụ ánh xạ (Mapper) kèm bộ kết hợp (In-mapper Combiner)
- * cho một phân đoạn (Split) cụ thể.
- *
- * Nhiệm vụ:
- * 1. Mở SplitReader cho khoảng byte [startByte, endByte).
- * 2. Đọc luồng từng dòng, phân tách tọa độ vector (bỏ qua số cột skipCols nếu có).
- * 3. Tìm tâm cụm gần nhất dựa trên khoảng cách Euclid bình phương.
- * 4. Tích lũy trực tiếp vào PartialResult cục bộ (In-mapper Combiner).
- * 5. Tái sử dụng mảng nhớ (pointBuffer), không cấp phát mới đối tượng trong vòng lặp lớn
- *    để giảm tải tối đa cho Garbage Collector (GC).
- */
 public class MapTask implements Callable<PartialResult> {
     private final File file;
     private final Split split;
@@ -112,4 +100,3 @@ public class MapTask implements Callable<PartialResult> {
         return targetIdx == dim;
     }
 }
-

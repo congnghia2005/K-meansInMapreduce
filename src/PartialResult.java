@@ -1,16 +1,5 @@
 import java.util.Arrays;
 
-/**
- * PartialResult: Kết quả cộng dồn cục bộ của bộ kết hợp (In-mapper Combiner).
- * Thay vì phát ra từng cặp (clusterId, point) gây nghẽn Shuffle và tràn bộ nhớ RAM,
- * mỗi mapper giữ một đối tượng PartialResult riêng biệt để tích lũy:
- * - Tổng vector tọa độ các điểm thuộc mỗi cụm (clusterSums).
- * - Số lượng điểm thuộc mỗi cụm (clusterCounts).
- * - Sai số bình phương Euclid cục bộ (clusterSSE).
- *
- * Nhờ việc mỗi luồng sở hữu một vùng nhớ độc lập (thread-confined), hoàn toàn KHÔNG
- * có tranh chấp tài nguyên (zero lock contention) và KHÔNG xảy ra hiện tượng False Sharing.
- */
 public class PartialResult {
     private final int splitId;
     private final int k;
@@ -122,4 +111,3 @@ public class PartialResult {
         return endEpochMs - startEpochMs;
     }
 }
-
